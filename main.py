@@ -1,170 +1,207 @@
 import os
-import json
 import numpy as np
-from flask import Flask, request, jsonify
-from supabase import create_client, Client 
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List
+from supabase import create_client, Client
+import json
 
 # --- SERVER CONFIGURATION ---
 SCORE_HISTORY_WINDOW = 10
-DIFFICULTY_LEVELS = 3
-DEFAULT_DIFFICULTY_INDEX = 1
-
-# Environment variables are critical for security and deployment (e.g., on Render)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SUPABASE_KEY")
 SUPABASE_TABLE = "scores_history" 
+DIFFICULTY_LEVELS = 3
+DEFAULT_DIFFICULTY_INDEX = 1
 
 # Initialize Supabase Client
 try:
-    # IMPORTANT: Ensure SUPABASE_URL and SUPABASE_KEY are set
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
-    print(f"Failed to initialize Supabase client. Check environment variables: {e}")
+    print(f"Failed to initialize Supabase client: {e}")
     supabase = None 
 
-# --- ADAPTIVE LOGIC FUNCTIONS (Mirrors C++ Complexity) ---
+# --- RL CONFIGURATION (Q-Learning) ---
+# Environment parameters (3200 states)
+RL_Y_BUCKETS = 10
+RL_VEL_BUCKETS = 8
+RL_DIST_BUCKETS = 8
+RL_GAP_BUCKETS = 5
+ACTIONS = 2
+SCREEN_HEIGHT = 64
+SCREEN_WIDTH = 128
+STATES = RL_Y_BUCKETS * RL_VEL_BUCKETS * RL_DIST_BUCKETS * RL_GAP_BUCKETS
 
-def compute_trend(arr):
-    """Compute linear trend (slope) for a score list for performance analysis."""
-    n = len(arr)
-    if n <= 1: return 0.0
-    x = np.arange(n)
-    y = np.array(arr)
-    
-    sum_x = np.sum(x)
-    sum_y = np.sum(y)
-    sum_xy = np.sum(x * y)
-    sum_x2 = np.sum(x * x)
-    
-    denom = (n * sum_x2 - sum_x * sum_x)
-    
-    if abs(denom) < 1e-6: return 0.0
-        
-    slope = (n * sum_xy - sum_x * sum_y) / denom
-    return float(slope)
+# RL Hyperparameters
+ALPHA = 0.12 
+GAMMA = 0.95 
+EPSILON = 0.15 
 
-def compute_std_dev(arr):
-    """Compute standard deviation of a list for consistency analysis."""
-    if not arr: return 0.0
-    return float(np.std(arr))
+# Initialize Q-Table (In-Memory)
+Q = np.zeros((STATES, ACTIONS), dtype=np.float32)
+try:
+    # NOTE: This load/save approach requires persistent storage setup (e.g., Render Disk).
+    Q = np.load("qtable.npy")
+    print("Q-table loaded successfully from qtable.npy.")
+except FileNotFoundError:
+    print("qtable.npy not found. Initializing Q-table to zeros.")
 
-def compute_adaptive_difficulty(score_hist, flap_hist):
+# --- FASTAPI SETUP ---
+app = FastAPI(title="ReflexIQ RL/Adaptive Backend")
+
+# Configure CORS (CRITICAL for ESP32/Cross-Origin communication)
+origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- DATA MODELS ---
+
+class RlExperience(BaseModel):
+    """Schema for the experience tuple sent by the ESP32 client (Competitor Mode)."""
+    state: List[float] # [birdY, velocity, pipeX, gapY]
+    action: int
+    reward: float
+    done: bool
+    player_name: str
+
+class AdaptiveScore(BaseModel):
+    """Schema for score logging sent by the ESP32 client (Adaptive Mode)."""
+    player: str = Field(alias="player_name") # ESP32 sends 'player'
+    score: int
+
+class ActionResponse(BaseModel):
+    """Schema for the next action returned to the ESP32 client."""
+    action: int
+
+# --- RL HELPER FUNCTIONS (Discretization) ---
+
+def get_state_index(birdY: float, birdVel: float, pipeXlocal: float, gapYpos: float) -> int:
+    """Discretizes the continuous state space into a single integer index."""
+    
+    yBucket = int((birdY * RL_Y_BUCKETS) / (SCREEN_HEIGHT + 1))
+    yBucket = max(0, min(RL_Y_BUCKETS - 1, yBucket))
+
+    vcl = min(max(birdVel, -6.0), 6.0)
+    velBucket = int(((vcl + 6.0) / 12.0) * RL_VEL_BUCKETS)
+    velBucket = max(0, min(RL_VEL_BUCKETS - 1, velBucket))
+
+    dist = max(0, min(pipeXlocal, SCREEN_WIDTH))
+    distBucket = int((dist * RL_DIST_BUCKETS) / (SCREEN_WIDTH + 1))
+    distBucket = max(0, min(RL_DIST_BUCKETS - 1, distBucket))
+
+    gapBucket = int((gapYpos * RL_GAP_BUCKETS) / (SCREEN_HEIGHT + 1))
+    gapBucket = max(0, min(RL_GAP_BUCKETS - 1, gapBucket))
+
+    idx = yBucket
+    idx = idx * RL_VEL_BUCKETS + velBucket
+    idx = idx * RL_DIST_BUCKETS + distBucket
+    idx = idx * RL_GAP_BUCKETS + gapBucket
+    
+    return idx
+
+# --- RL ENDPOINT (COMPETITOR MODE) ---
+
+@app.post("/api/rl-step", response_model=ActionResponse)
+async def rl_step(experience: RlExperience):
     """
-    Computes the suggested adaptive difficulty index (0-2) using the complex 
-    formula involving trend, consistency, average score, and normalized flap rate.
+    Receives an experience tuple, updates the Q-table, and returns the next action.
     """
+    global Q 
     
-    # 1. Calculate Score Metrics
-    avg = np.mean(score_hist) if score_hist else 0
-    stddev = compute_std_dev(score_hist)
-    trend = compute_trend(score_hist) 
-
-    # 2. Calculate Flap Metrics
-    avg_flaps = np.mean(flap_hist) if flap_hist else 0
-
-    # Flap factor: rewards high activity relative to score, weighted by 0.5.
-    # This detects high engagement/effort, suggesting ability to handle higher difficulty.
-    flap_factor = (avg_flaps / (avg + 1.0)) * 0.5
+    s = get_state_index(*experience.state)
+    s_prime = s # Using current state as s' for immediate update
     
-    # 3. Improvement Factor (Matching C++ Formula)
-    improvement_factor = trend * 2.0 - (stddev / 6.0) + (avg / 30.0) + flap_factor
-
-    # 4. Inertia and Clamping Logic (Matching C++ Thresholds)
-    candidate = DEFAULT_DIFFICULTY_INDEX
+    a = experience.action
+    r = experience.reward
+    done = experience.done
     
-    if improvement_factor > 1.4:
-        candidate = 2
-    elif improvement_factor < -1.0:
-        candidate = 0
-    elif improvement_factor > 0.8:
-        candidate = 2 
-    elif improvement_factor < -0.6:
-        candidate = 0
+    if s >= STATES or a >= ACTIONS:
+        raise HTTPException(status_code=400, detail="Invalid state or action index.")
+
+    # Q-Learning Update
+    if done:
+        target = r
+    else:
+        max_q_s_prime = np.max(Q[s_prime])
+        target = r + GAMMA * max_q_s_prime
+
+    Q[s, a] = Q[s, a] + ALPHA * (target - Q[s, a])
+
+    # Epsilon-Greedy Policy for Next Action
+    if np.random.rand() < EPSILON and not done:
+        next_action = np.random.randint(ACTIONS) # Explore
+    else:
+        next_action = np.argmax(Q[s_prime]) # Exploit
     
-    # The server calculates a strong suggestion, which the ESP32 then dampens with its local inertia.
-    return max(0, min(DIFFICULTY_LEVELS - 1, candidate))
+    # Optional: Save Q-table periodically (e.g., every 5 minutes)
+    # This logic is best handled by a background task/cron job for a production system.
 
-# --- FLASK APPLICATION SETUP ---
+    return ActionResponse(action=int(next_action))
 
-app = Flask(__name__)
 
-@app.route('/adaptive_logic', methods=['POST'])
-def adaptive_logic():
+# --- ADAPTIVE ENDPOINT (ADAPTIVE MODE LOGGING) ---
+
+@app.post("/adaptive_logic")
+async def adaptive_logic(data: AdaptiveScore):
+    """
+    Logs score history from the ESP32's local adaptive mode.
+    Returns a default response as the ESP32 calculates difficulty locally.
+    """
     global supabase
     if not supabase:
-        print("Error: Supabase client not initialized.")
-        return jsonify({"error": "Database service unavailable"}), 503
+        print("Supabase connection unavailable for adaptive logging.")
+        return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
 
     try:
-        data = request.get_json(force=True)
-    except json.JSONDecodeError:
-        return jsonify({"error": "Invalid JSON format"}), 400
-
-    player_name = data.get('player')
-    score = data.get('score')
-    # Assumes ESP32 sends "flaps" in the POST request body
-    flaps = data.get('flaps', 0) 
-
-    if player_name is None or score is None:
-        return jsonify({"error": "Missing 'player' or 'score' in request body"}), 400
-        
-    try:
-        score = int(score)
-        flaps = int(flaps)
-    except ValueError:
-        return jsonify({"error": "Score/Flaps must be integers"}), 400
-        
-    try:
-        # 1. LOG NEW SCORE (INSERT)
+        # LOG NEW SCORE (INSERT)
         supabase.table(SUPABASE_TABLE).insert({
-            "player_name": player_name, 
-            "score": score,
-            "flaps": flaps
+            "player_name": data.player, 
+            "score": data.score,
+            "flaps": 0 # Flaps aren't sent in this specific adaptive payload, default to 0
         }).execute()
-
-        # 2. FETCH HISTORY (SELECT)
-        response = supabase.table(SUPABASE_TABLE).select("score, flaps").eq(
-            "player_name", player_name
-        ).order(
-            "created_at", desc=True
-        ).limit(
-            SCORE_HISTORY_WINDOW
-        ).execute()
         
-        history_data = response.data
-        if not history_data:
-            return jsonify({"player": player_name, "difficulty": DEFAULT_DIFFICULTY_INDEX}), 200
-
-        # Extract and reverse scores/flaps for trend calculation (oldest first)
-        score_history = [item['score'] for item in history_data][::-1] 
-        flap_history = [item['flaps'] for item in history_data][::-1]
-
-        # 3. COMPUTE DIFFICULTY
-        new_difficulty_index = compute_adaptive_difficulty(score_history, flap_history)
-        
-        return jsonify({"player": player_name, "difficulty": new_difficulty_index}), 200
+        # Return a valid response expected by the ESP32
+        return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
 
     except Exception as e:
-        print(f"Supabase Error: {e}")
-        return jsonify({"error": "Server database error"}), 500
+        print(f"Supabase Error during adaptive log: {e}")
+        return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
 
-@app.route('/scores', methods=['GET'])
-def get_scores():
-    """Simple GET endpoint to view the latest scores."""
-    global supabase
-    if not supabase:
-        return jsonify({"error": "Database service unavailable"}), 503
+
+# --- UTILITY ENDPOINTS ---
+
+@app.get("/api/info")
+async def get_info():
+    """Returns RL parameters and Q-table summary for monitoring."""
+    return {
+        "status": "RL Server Active",
+        "state_space_size": STATES,
+        "action_space_size": ACTIONS,
+        "q_table_sum": float(np.sum(Q)),
+        "q_table_max": float(np.max(Q)),
+        "epsilon": EPSILON,
+        "gamma": GAMMA,
+        "alpha": ALPHA,
+    }
+
+@app.get("/api/save_q")
+async def save_q_table():
+    """Manual endpoint to save the Q-table to disk."""
     try:
-        response = supabase.table(SUPABASE_TABLE).select("*").order("created_at", desc=True).limit(50).execute()
-        return jsonify(response.data), 200
+        np.save("qtable.npy", Q)
+        return {"message": "Q-table saved successfully to qtable.npy"}
     except Exception as e:
-        return jsonify({"error": "Server database error"}), 500
+        return {"error": f"Failed to save Q-table: {e}"}
 
-# --- SERVER STARTUP ---
 
 if __name__ == '__main__':
-    # Running locally uses Flask's built-in server. 
-    # Render deployment uses Gunicorn (via the 'gunicorn server:app' command).
-    print("Starting Flask server locally on http://0.0.0.0:5000")
-    print("Database connection URL:", SUPABASE_URL)
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Running locally uses uvicorn directly
+    import uvicorn
+    print("Starting FastAPI server locally on http://0.0.0.0:8000")
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
