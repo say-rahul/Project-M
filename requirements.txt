@@ -1,0 +1,4 @@
+flask
+numpy
+supabase
+gunicorn
