@@ -33,15 +33,14 @@ SCREEN_HEIGHT = 64
 SCREEN_WIDTH = 128
 STATES = RL_Y_BUCKETS * RL_VEL_BUCKETS * RL_DIST_BUCKETS * RL_GAP_BUCKETS
 
-# RL Hyperparameters
-ALPHA = 0.12 
-GAMMA = 0.95 
-EPSILON = 0.15 
+# RL Hyperparameters (ADJUSTED FOR FASTER LEARNING/CRASH AVOIDANCE)
+ALPHA = 0.25  # Increased Learning Rate (was 0.12)
+GAMMA = 0.90  # Reduced Discount Factor (was 0.95)
+EPSILON = 0.30 # Increased Exploration Rate (was 0.15)
 
 # Initialize Q-Table (In-Memory)
 Q = np.zeros((STATES, ACTIONS), dtype=np.float32)
 try:
-    # NOTE: This load/save approach requires persistent storage setup (e.g., Render Disk).
     Q = np.load("qtable.npy")
     print("Q-table loaded successfully from qtable.npy.")
 except FileNotFoundError:
@@ -63,27 +62,22 @@ app.add_middleware(
 # --- DATA MODELS ---
 
 class RlExperience(BaseModel):
-    """Schema for the experience tuple sent by the ESP32 client (Competitor Mode)."""
-    state: List[float] # [birdY, velocity, pipeX, gapY]
+    state: List[float]
     action: int
     reward: float
     done: bool
     player_name: str
 
 class AdaptiveScore(BaseModel):
-    """Schema for score logging sent by the ESP32 client (Adaptive Mode)."""
-    player: str = Field(alias="player_name") # ESP32 sends 'player'
+    player: str = Field(alias="player_name")
     score: int
 
 class ActionResponse(BaseModel):
-    """Schema for the next action returned to the ESP32 client."""
     action: int
 
 # --- RL HELPER FUNCTIONS (Discretization) ---
 
 def get_state_index(birdY: float, birdVel: float, pipeXlocal: float, gapYpos: float) -> int:
-    """Discretizes the continuous state space into a single integer index."""
-    
     yBucket = int((birdY * RL_Y_BUCKETS) / (SCREEN_HEIGHT + 1))
     yBucket = max(0, min(RL_Y_BUCKETS - 1, yBucket))
 
@@ -115,7 +109,7 @@ async def rl_step(experience: RlExperience):
     global Q 
     
     s = get_state_index(*experience.state)
-    s_prime = s # Using current state as s' for immediate update
+    s_prime = s 
     
     a = experience.action
     r = experience.reward
@@ -139,9 +133,6 @@ async def rl_step(experience: RlExperience):
     else:
         next_action = np.argmax(Q[s_prime]) # Exploit
     
-    # Optional: Save Q-table periodically (e.g., every 5 minutes)
-    # This logic is best handled by a background task/cron job for a production system.
-
     return ActionResponse(action=int(next_action))
 
 
@@ -150,23 +141,19 @@ async def rl_step(experience: RlExperience):
 @app.post("/adaptive_logic")
 async def adaptive_logic(data: AdaptiveScore):
     """
-    Logs score history from the ESP32's local adaptive mode.
-    Returns a default response as the ESP32 calculates difficulty locally.
+    Logs score history from the ESP32's local adaptive mode to Supabase.
     """
     global supabase
     if not supabase:
-        print("Supabase connection unavailable for adaptive logging.")
         return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
 
     try:
-        # LOG NEW SCORE (INSERT)
         supabase.table(SUPABASE_TABLE).insert({
             "player_name": data.player, 
             "score": data.score,
-            "flaps": 0 # Flaps aren't sent in this specific adaptive payload, default to 0
+            "flaps": 0 
         }).execute()
         
-        # Return a valid response expected by the ESP32
         return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
 
     except Exception as e:
