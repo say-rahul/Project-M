@@ -3,27 +3,33 @@ import numpy as np
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict, Any
 from supabase import create_client, Client
 import json
+import math # Used for isnan checks later if needed
 
 # --- SERVER CONFIGURATION ---
 SCORE_HISTORY_WINDOW = 10
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SUPABASE_KEY")
-SUPABASE_TABLE = "scores_history" 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "DEFAULT_SUPABASE_URL") # Provide a default or handle missing env var
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "DEFAULT_SUPABASE_KEY") # Provide a default or handle missing env var
+SUPABASE_TABLE = "scores_history"
 DIFFICULTY_LEVELS = 3
 DEFAULT_DIFFICULTY_INDEX = 1
 
 # Initialize Supabase Client
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if SUPABASE_URL and SUPABASE_KEY and SUPABASE_URL != "DEFAULT_SUPABASE_URL":
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase client initialized.")
+    else:
+        print("SupABASE_URL or SUPABASE_KEY not set. Supabase integration disabled.")
+        supabase = None
 except Exception as e:
     print(f"Failed to initialize Supabase client: {e}")
-    supabase = None 
+    supabase = None
 
 # --- RL CONFIGURATION (Q-Learning) ---
-# Environment parameters (3200 states)
+# Environment parameters
 RL_Y_BUCKETS = 10
 RL_VEL_BUCKETS = 8
 RL_DIST_BUCKETS = 8
@@ -33,10 +39,10 @@ SCREEN_HEIGHT = 64
 SCREEN_WIDTH = 128
 STATES = RL_Y_BUCKETS * RL_VEL_BUCKETS * RL_DIST_BUCKETS * RL_GAP_BUCKETS
 
-# RL Hyperparameters (ADJUSTED FOR FASTER LEARNING/CRASH AVOIDANCE)
-ALPHA = 0.25  # Increased Learning Rate (was 0.12)
-GAMMA = 0.90  # Reduced Discount Factor (was 0.95)
-EPSILON = 0.30 # Increased Exploration Rate (was 0.15)
+# RL Hyperparameters
+ALPHA = 0.25  
+GAMMA = 0.90  
+EPSILON = 0.30 
 
 # Initialize Q-Table (In-Memory)
 Q = np.zeros((STATES, ACTIONS), dtype=np.float32)
@@ -46,10 +52,46 @@ try:
 except FileNotFoundError:
     print("qtable.npy not found. Initializing Q-table to zeros.")
 
-# --- FASTAPI SETUP ---
-app = FastAPI(title="ReflexIQ RL/Adaptive Backend")
+# --- DYNAMIC DIFFICULTY/ANTAGONIST CONFIGURATION ---
 
-# Configure CORS (CRITICAL for ESP32/Cross-Origin communication)
+# Base Difficulty Parameters (Matches Arduino's HARD setting - Index 2)
+BASE_PIPE_SPEED = 2.9
+BASE_GAP_HEIGHT = 20.0 # Use float for calculations
+BASE_GRAVITY = 0.50
+
+# Difficulty Limits
+MAX_PIPE_SPEED = 4.5
+MIN_GAP_HEIGHT = 15.0 
+MAX_GAP_HEIGHT = 25.0 # Add max gap to prevent it getting too easy
+MAX_GRAVITY = 0.65
+MIN_GRAVITY = 0.45 # Add min gravity
+
+# Adjustment Steps (How much to change per RL update based on reward)
+# Positive reward (doing well) -> Increase difficulty
+POS_REWARD_STEP_SPEED = 0.03
+POS_REWARD_STEP_GAP = -0.5  # Decrease gap
+POS_REWARD_STEP_GRAVITY = 0.01
+
+# Negative reward (doing poorly) -> Decrease difficulty
+NEG_REWARD_STEP_SPEED = -0.06 # Larger decrease
+NEG_REWARD_STEP_GAP = 1.0   # Increase gap
+NEG_REWARD_STEP_GRAVITY = -0.02
+
+# Player Antagonist State Storage
+antagonist_states: Dict[str, Dict[str, Any]] = {}
+
+def get_initial_antagonist_params() -> Dict[str, Any]:
+    """Returns the base starting parameters for a player."""
+    return {
+        "pipeSpeed": BASE_PIPE_SPEED,
+        "gapHeight": BASE_GAP_HEIGHT,
+        "gravity": BASE_GRAVITY
+    }
+
+# --- FASTAPI SETUP ---
+app = FastAPI(title="ReflexIQ RL/Antagonist Backend")
+
+# Configure CORS
 origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +106,7 @@ app.add_middleware(
 class RlExperience(BaseModel):
     state: List[float]
     action: int
-    reward: float
+    reward: float # Accumulated reward since last send
     done: bool
     player_name: str
 
@@ -72,123 +114,202 @@ class AdaptiveScore(BaseModel):
     player: str = Field(alias="player_name")
     score: int
 
-class ActionResponse(BaseModel):
+# **UPDATED** Response Model for Competitor Mode
+class AntagonistResponse(BaseModel):
     action: int
+    pipeSpeed: float
+    gapHeight: float # Send as float
+    gravity: float
 
-# --- RL HELPER FUNCTIONS (Discretization) ---
-
+# --- RL HELPER FUNCTIONS (Discretization - Unchanged) ---
 def get_state_index(birdY: float, birdVel: float, pipeXlocal: float, gapYpos: float) -> int:
+    # Ensure inputs are valid numbers
+    if any(math.isnan(x) for x in [birdY, birdVel, pipeXlocal, gapYpos]):
+        return -1 # Indicate invalid state
+
     yBucket = int((birdY * RL_Y_BUCKETS) / (SCREEN_HEIGHT + 1))
     yBucket = max(0, min(RL_Y_BUCKETS - 1, yBucket))
 
-    vcl = min(max(birdVel, -6.0), 6.0)
-    velBucket = int(((vcl + 6.0) / 12.0) * RL_VEL_BUCKETS)
+    # Clamp velocity more realistically if needed
+    vcl = min(max(birdVel, -8.0), 8.0) 
+    # Adjusted velocity bucket calculation for potentially wider range
+    velBucket = int(((vcl + 8.0) / 16.0) * RL_VEL_BUCKETS) 
     velBucket = max(0, min(RL_VEL_BUCKETS - 1, velBucket))
 
+    # Clamp distance
     dist = max(0, min(pipeXlocal, SCREEN_WIDTH))
     distBucket = int((dist * RL_DIST_BUCKETS) / (SCREEN_WIDTH + 1))
     distBucket = max(0, min(RL_DIST_BUCKETS - 1, distBucket))
-
-    gapBucket = int((gapYpos * RL_GAP_BUCKETS) / (SCREEN_HEIGHT + 1))
+    
+    # Clamp gap position
+    clamped_gapYpos = max(0, min(gapYpos, SCREEN_HEIGHT))
+    gapBucket = int((clamped_gapYpos * RL_GAP_BUCKETS) / (SCREEN_HEIGHT + 1))
     gapBucket = max(0, min(RL_GAP_BUCKETS - 1, gapBucket))
 
+    # Calculate index safely
     idx = yBucket
     idx = idx * RL_VEL_BUCKETS + velBucket
     idx = idx * RL_DIST_BUCKETS + distBucket
     idx = idx * RL_GAP_BUCKETS + gapBucket
     
+    # Final check for index bounds
+    idx = max(0, min(STATES - 1, idx))
+    
     return idx
 
-# --- RL ENDPOINT (COMPETITOR MODE) ---
+# --- NEW ANTAGONIST LOGIC ---
+def adjust_antagonist_params(player_name: str, reward: float, is_done: bool) -> Dict[str, Any]:
+    """
+    Adjusts game parameters based on accumulated reward.
+    Returns the *new target* parameters for the client.
+    """
+    if player_name not in antagonist_states:
+        antagonist_states[player_name] = get_initial_antagonist_params()
 
-@app.post("/api/rl-step", response_model=ActionResponse)
+    # Get current parameters for this player
+    current_params = antagonist_states[player_name]
+    
+    # If the game just ended, reset to base difficulty for the next round
+    if is_done:
+        antagonist_states[player_name] = get_initial_antagonist_params()
+        return antagonist_states[player_name] # Return base params immediately
+
+    adj_speed = 0.0
+    adj_gap = 0.0
+    adj_gravity = 0.0
+    
+    # Thresholds for reward interpretation (tune these)
+    GOOD_PERFORMANCE_THRESHOLD = 0.5 # e.g., survived a while or cleared a pipe recently
+    POOR_PERFORMANCE_THRESHOLD = -0.5 # e.g., crashed
+
+    # Positive Reward -> Increase Difficulty
+    if reward > GOOD_PERFORMANCE_THRESHOLD:
+        adj_speed = POS_REWARD_STEP_SPEED
+        adj_gap = POS_REWARD_STEP_GAP
+        adj_gravity = POS_REWARD_STEP_GRAVITY
+        
+    # Negative Reward -> Decrease Difficulty
+    elif reward < POOR_PERFORMANCE_THRESHOLD: 
+        adj_speed = NEG_REWARD_STEP_SPEED
+        adj_gap = NEG_REWARD_STEP_GAP
+        adj_gravity = NEG_REWARD_STEP_GRAVITY
+
+    # Apply adjustments and clamp within defined limits
+    new_speed = max(BASE_PIPE_SPEED, min(MAX_PIPE_SPEED, current_params['pipeSpeed'] + adj_speed))
+    new_gap = max(MIN_GAP_HEIGHT, min(MAX_GAP_HEIGHT, current_params['gapHeight'] + adj_gap))
+    new_gravity = max(MIN_GRAVITY, min(MAX_GRAVITY, current_params['gravity'] + adj_gravity))
+
+    # Update the player's state
+    current_params['pipeSpeed'] = new_speed
+    current_params['gapHeight'] = new_gap
+    current_params['gravity'] = new_gravity
+
+    antagonist_states[player_name] = current_params
+    return current_params
+
+# --- RL ENDPOINT (COMPETITOR MODE - UPDATED) ---
+@app.post("/api/rl-step", response_model=AntagonistResponse)
 async def rl_step(experience: RlExperience):
     """
-    Receives an experience tuple, updates the Q-table, and returns the next action.
+    Receives experience, updates Q-table, adjusts antagonist params, 
+    returns next action and new params.
     """
-    global Q 
-    
+    global Q, antagonist_states
+
+    # 1. Get current state index (s)
     s = get_state_index(*experience.state)
-    s_prime = s 
     
     a = experience.action
-    r = experience.reward
+    r = experience.reward # Accumulated reward
     done = experience.done
-    
-    if s >= STATES or a >= ACTIONS:
-        raise HTTPException(status_code=400, detail="Invalid state or action index.")
+    player_name = experience.player_name
 
-    # Q-Learning Update
+    # Handle invalid state index gracefully
+    if s < 0 or s >= STATES or a < 0 or a >= ACTIONS:
+        print(f"Warning: Invalid state or action index received. s={s}, a={a}. State: {experience.state}")
+        # Return current params and a random action if state is invalid
+        current_params = antagonist_states.get(player_name, get_initial_antagonist_params())
+        return AntagonistResponse(
+            action=np.random.randint(ACTIONS), 
+            pipeSpeed=current_params['pipeSpeed'],
+            gapHeight=current_params['gapHeight'],
+            gravity=current_params['gravity']
+        )
+
+    # --- Q-Learning Update ---
     if done:
         target = r
+        next_action_index = np.random.randint(ACTIONS) # Action for next state (which won't happen)
     else:
-        max_q_s_prime = np.max(Q[s_prime])
-        target = r + GAMMA * max_q_s_prime
+        max_q_s = np.max(Q[s]) # Use max Q of current state 's'
+        target = r + GAMMA * max_q_s
+        
+        # Epsilon-Greedy Policy for next action selection based on state 's'
+        if np.random.rand() < EPSILON:
+            next_action_index = np.random.randint(ACTIONS) # Explore
+        else:
+            next_action_index = np.argmax(Q[s]) # Exploit
 
+    # Update Q-table value for the state-action pair (s, a)
     Q[s, a] = Q[s, a] + ALPHA * (target - Q[s, a])
 
-    # Epsilon-Greedy Policy for Next Action
-    if np.random.rand() < EPSILON and not done:
-        next_action = np.random.randint(ACTIONS) # Explore
-    else:
-        next_action = np.argmax(Q[s_prime]) # Exploit
-    
-    return ActionResponse(action=int(next_action))
+    # --- Adjust Antagonist/Difficulty Parameters ---
+    # This uses the reward from the *just completed* step to decide the *next* difficulty
+    new_antagonist_params = adjust_antagonist_params(player_name, r, done)
+
+    # --- Return Response ---
+    return AntagonistResponse(
+        action=int(next_action_index),
+        pipeSpeed=new_antagonist_params['pipeSpeed'],
+        gapHeight=new_antagonist_params['gapHeight'], # Send float
+        gravity=new_antagonist_params['gravity']
+    )
 
 
-# --- ADAPTIVE ENDPOINT (ADAPTIVE MODE LOGGING) ---
-
+# --- ADAPTIVE ENDPOINT (Unchanged) ---
 @app.post("/adaptive_logic")
 async def adaptive_logic(data: AdaptiveScore):
-    """
-    Logs score history from the ESP32's local adaptive mode to Supabase.
-    """
+    """Logs score history from Adaptive Mode to Supabase."""
     global supabase
     if not supabase:
         return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
-
     try:
         supabase.table(SUPABASE_TABLE).insert({
             "player_name": data.player, 
             "score": data.score,
-            "flaps": 0 
+            "flaps": 0 # Placeholder, not tracked in this mode
         }).execute()
-        
         return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
-
     except Exception as e:
         print(f"Supabase Error during adaptive log: {e}")
         return {"player": data.player, "difficulty": DEFAULT_DIFFICULTY_INDEX}
 
-
-# --- UTILITY ENDPOINTS ---
-
+# --- UTILITY ENDPOINTS (Unchanged) ---
 @app.get("/api/info")
 async def get_info():
-    """Returns RL parameters and Q-table summary for monitoring."""
+    """Returns RL parameters and Q-table summary."""
     return {
         "status": "RL Server Active",
         "state_space_size": STATES,
         "action_space_size": ACTIONS,
         "q_table_sum": float(np.sum(Q)),
         "q_table_max": float(np.max(Q)),
-        "epsilon": EPSILON,
-        "gamma": GAMMA,
-        "alpha": ALPHA,
+        "epsilon": EPSILON, "gamma": GAMMA, "alpha": ALPHA,
+        "current_antagonist_states": antagonist_states # Show current dynamic difficulties
     }
 
 @app.get("/api/save_q")
 async def save_q_table():
-    """Manual endpoint to save the Q-table to disk."""
+    """Manual endpoint to save the Q-table."""
     try:
         np.save("qtable.npy", Q)
         return {"message": "Q-table saved successfully to qtable.npy"}
     except Exception as e:
         return {"error": f"Failed to save Q-table: {e}"}
 
-
+# --- MAIN EXECUTION ---
 if __name__ == '__main__':
-    # Running locally uses uvicorn directly
     import uvicorn
     print("Starting FastAPI server locally on http://0.0.0.0:8000")
+    # Use reload=True for development, consider removing for production
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
