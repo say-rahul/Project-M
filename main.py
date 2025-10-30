@@ -11,6 +11,7 @@ import math
 # --- SERVER CONFIGURATION ---
 SCORE_HISTORY_WINDOW = 10
 # NOTE: Ensure these environment variables are set correctly on your hosting platform (e.g., Render)
+# The server will look for these environment variables (SUPABASE_URL, SUPABASE_KEY).
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "DEFAULT_SUPABASE_URL") 
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "DEFAULT_SUPABASE_KEY")
 SUPABASE_TABLE = "scores_history"
@@ -28,6 +29,14 @@ try:
 except Exception as e:
     print(f"Failed to initialize Supabase client: {e}")
     supabase = None
+
+# --- IMPORTANT RLS/PERMISSIONS NOTE ---
+# The error "violates row-level security policy" means the Supabase database
+# is rejecting the insertion, NOT that the Python code is broken.
+# TO FIX THIS: You must go to your Supabase project and adjust the RLS policy
+# for the 'scores_history' table to allow the key used by this server (e.g., the Anon key)
+# to perform INSERT operations.
+# ---------------------------------------
 
 # --- RL CONFIGURATION (Q-Learning) ---
 # Environment parameters (Tuning these values can drastically change the AI's learning behavior)
@@ -92,7 +101,6 @@ def get_initial_antagonist_params() -> Dict[str, Any]:
     }
 
 # --- FASTAPI SETUP ---
-# FIX: Ensure app name matches the filename "server" if running with uvicorn server:app
 app = FastAPI(title="ReflexIQ RL/Antagonist Backend")
 
 # Configure CORS
@@ -172,6 +180,7 @@ def adjust_antagonist_params(player_name: str, reward: float, is_done: bool) -> 
     
     # If the game just ended, reset to base difficulty for the next round
     if is_done:
+        # Player crashed (reward is -1.0), reset difficulty to base (HARD)
         antagonist_states[player_name] = get_initial_antagonist_params()
         return antagonist_states[player_name]
 
@@ -179,10 +188,6 @@ def adjust_antagonist_params(player_name: str, reward: float, is_done: bool) -> 
     adj_gap = 0.0
     adj_gravity = 0.0
     
-    # Since the reward is +1.0 for every pipe and -1.0 for a crash,
-    # a positive accumulated reward (e.g., 3.0 or 6.0) means success.
-    # A crash packet will send a -1.0 reward (handled by the 'is_done' block above).
-
     # Successful step (reward > 0.0) -> Increase Difficulty
     if reward > 0.0:
         adj_speed = POS_REWARD_STEP_SPEED
@@ -190,7 +195,6 @@ def adjust_antagonist_params(player_name: str, reward: float, is_done: bool) -> 
         adj_gravity = POS_REWARD_STEP_GRAVITY
         
     # Apply adjustments and clamp within defined limits
-    # Clamping ensures difficulty doesn't become impossible or trivially easy.
     new_speed = max(MIN_PIPE_SPEED, min(MAX_PIPE_SPEED, current_params['pipeSpeed'] + adj_speed))
     new_gap = max(MIN_GAP_HEIGHT, min(MAX_GAP_HEIGHT, current_params['gapHeight'] + adj_gap))
     new_gravity = max(MIN_GRAVITY, min(MAX_GRAVITY, current_params['gravity'] + adj_gravity))
@@ -278,6 +282,7 @@ async def adaptive_logic(data: AdaptiveScore):
     global supabase
     if supabase:
         try:
+            # This logic is compatible with the scores_history.sql schema in the Canvas
             supabase.table(SUPABASE_TABLE).insert({
                 "player_name": data.player, 
                 "score": data.score,
